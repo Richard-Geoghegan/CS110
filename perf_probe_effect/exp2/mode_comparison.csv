@@ -1,0 +1,9 @@
+test_type,sample_freq,execution_time,overhead_percent
+0,baseline,.790218,0.0
+1,counting,.820522,3.00
+2,sampling_100,.812062,2.00
+2,sampling_500,.860132,8.00
+2,sampling_1000,.842833,6.00
+2,sampling_2000,.889358,12.00
+2,sampling_4000,.883464,11.00
+2,sampling_8000,.855470,8.00
