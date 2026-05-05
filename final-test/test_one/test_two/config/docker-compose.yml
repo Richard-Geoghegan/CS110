@@ -1,0 +1,36 @@
+# version: '3.8'
+# version: '3.8'
+services:
+  app-service:
+    build:
+      context: ../../app  # Points to phase1/app/
+      dockerfile: Dockerfile
+    container_name: app-service
+    mem_limit: 512m
+    cpus: "1.0"
+    environment:
+      - WORKLOAD_LOOPS=5000
+      - WORKLOAD_DELAY=0.01
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup:ro
+      - ../src/trace_bridge.py:/app/trace_bridge.py
+    command: >
+      bash -c "python3 /app/trace_bridge.py & python3 /app/app_service.py"
+    networks: [perf-net]
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:latest
+    command: ["--config=/etc/otel/config.yaml"]
+    volumes: [ "./otel-config.yaml:/etc/otel/config.yaml" ]
+    ports: ["4318:4318"]
+    networks: [perf-net]
+
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    ports: ["16686:16686", "14250:14250"]
+    networks: [perf-net]
+    depends_on: [otel-collector]
+
+networks:
+  perf-net:
+    driver: bridge

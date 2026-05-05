@@ -1,0 +1,63 @@
+# version: '3.8'
+services:
+  app-service:
+    build:
+      context: ./app
+      dockerfile: Dockerfile
+    container_name: app-service
+    mem_limit: 512m
+    cpus: "1.0"
+    environment:
+      - WORKLOAD_LOOPS=5000
+      - WORKLOAD_DELAY=0.01
+      - TRACE_SOCKET_PATH=/tmp/host_shared/trace_bridge.sock
+      - OTEL_SERVICE_NAME=app-service
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup:ro
+      - /tmp:/tmp/host_shared
+      - ./app/trace_bridge.py:/app/trace_bridge.py
+    command: >
+      bash -c "python3 /app/trace_bridge.py & python3 /app/app_service.py"
+    networks: [perf-net]
+
+  gateway:
+    image: nginx:alpine
+    container_name: gateway
+    mem_limit: 512m
+    cpus: "0.5"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    ports: ["8080:80"]
+    networks: [perf-net]
+    depends_on: [app-service]
+
+  db-service:
+    image: redis:alpine
+    container_name: db-service
+    mem_limit: 256m
+    cpus: "0.5"
+    networks: [perf-net]
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:latest
+    container_name: otel-collector
+    command: ["--config=/etc/otel/config.yaml"]
+    volumes:
+      - ./test_two/config/otel-config.yaml:/etc/otel/config.yaml:ro
+    ports: 
+      - "4318:4318"
+      - "4317:4317"
+    networks: 
+      - perf-net
+
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    container_name: jaeger
+    ports: ["16686:16686", "14250:14250"]
+    networks: [perf-net]
+    depends_on: [otel-collector]
+
+networks:
+  perf-net:
+    driver: bridge

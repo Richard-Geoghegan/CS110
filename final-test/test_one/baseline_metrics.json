@@ -1,0 +1,25 @@
+{
+  "vus": 10,
+  "duration_s": 30,
+  "total_reqs": 300,
+  "errors": 0,
+  "p50_ms": 13.48,
+  "p99_ms": 14.0,
+  "rps": 10.0,
+  "error_pct": 0.0,
+  "cgroup_metrics": {
+    "gateway": {
+      "cpu": "0.00%",
+      "mem": "3.613MiB / 512MiB"
+    },
+    "db-service": {
+      "cpu": "0.32%",
+      "mem": "11.11MiB / 256MiB"
+    },
+    "app-service": {
+      "cpu": "0.02%",
+      "mem": "16.12MiB / 512MiB"
+    }
+  },
+  "slo_validation": "PASS"
+}
