@@ -39,18 +39,23 @@ resolve_cgroup_path() {
 
 run_load() {
     local label="$1"
+    local out="$SCRIPT_DIR/results_${label}.json"
+    local metrics_file="$SCRIPT_DIR/.metrics_tmp"
+
     echo "[EXP] Running load ($label): $VUS VUs × ${DURATION}s → $TARGET_URL"
     python3 "$SCRIPT_DIR/baseline_profiler.py" 2>&1 | tail -6
-    # baseline_profiler.py writes baseline_metrics.json — rename per phase
-    local out="$SCRIPT_DIR/results_${label}.json"
+
     cp "$SCRIPT_DIR/baseline_metrics.json" "$out"
     echo "[EXP] Results saved to $out"
-    # Extract p50 and p99 for the CSV
+
+    # Write metrics to a temp file so stdout isn't polluted
     python3 - <<PYEOF
-import json, sys
+import json
 with open("$out") as f: r = json.load(f)
-print(f"{r['p50_ms']},{r['p99_ms']},{r['rps']},{r['error_pct']}")
+with open("$metrics_file", "w") as f:
+    f.write(f"{r['p50_ms']},{r['p99_ms']},{r['rps']},{r['error_pct']}\n")
 PYEOF
+    cat "$metrics_file"
 }
 
 start_daemon() {
@@ -108,7 +113,8 @@ for FREQ in "${FREQUENCIES[@]}"; do
         echo "[EXP] Baseline: no perf daemon."
     fi
 
-    METRICS=$(run_load "$PHASE_LABEL")
+    run_load "$PHASE_LABEL"
+    METRICS=$(cat "$SCRIPT_DIR/.metrics_tmp")
     echo "$FREQ,$METRICS" >> "$RESULTS"
     echo "[EXP] $PHASE_LABEL → p50/p99/rps/err%: $METRICS"
 done
