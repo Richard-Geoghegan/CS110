@@ -31,6 +31,7 @@ static int perf_fd = -1;
 static void *mmap_buf = NULL;
 static int ctl_fd = -1;
 static atomic_int current_freq = BASELINE_FREQ;
+static const char *g_cgroup_path = NULL;
 
 static void handle_sigint(int sig) { running = 0; }
 
@@ -43,16 +44,18 @@ static int open_perf_event(const char *cgroup_path, int freq) {
     pe.type = PERF_TYPE_HARDWARE;
     pe.config = PERF_COUNT_HW_CACHE_MISSES;
     pe.size = sizeof(pe);
+    pe.freq = 1;           /* required: treat sample_period as a frequency */
     pe.sample_freq = freq;
-    pe.sample_type = PERF_SAMPLE_IP | PERF_SAMPLE_TIME | PERF_SAMPLE_TID;
+    pe.sample_type = PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_TIME;
     pe.disabled = 0;
     pe.exclude_kernel = 1;
     pe.exclude_hv = 1;
     pe.use_clockid = 1;
     pe.clockid = CLOCK_MONOTONIC;
-    pe.cgroup = cg_fd;
 
-    int fd = syscall(SYS_perf_event_open, &pe, -1, 0, -1, PERF_FLAG_FD_CLOEXEC);
+    /* cgroup-scoped sampling: pass cgroup fd as pid with PERF_FLAG_PID_CGROUP */
+    int fd = syscall(SYS_perf_event_open, &pe, cg_fd, 0, -1,
+                     PERF_FLAG_FD_CLOEXEC | PERF_FLAG_PID_CGROUP);
     close(cg_fd);
     return fd;
 }
@@ -64,7 +67,7 @@ static int toggle_sampling_freq(int new_freq) {
     
     /* Recreate fd with new frequency (safest for live tuning) */
     if (perf_fd >= 0) close(perf_fd);
-    perf_fd = open_perf_event("/sys/fs/cgroup/app-service/cgroup.procs", new_freq);
+    perf_fd = open_perf_event(g_cgroup_path, new_freq);
     if (perf_fd < 0) return -1;
 
     /* Re-map ring buffer */
@@ -86,7 +89,7 @@ static int fetch_trace_context(pid_t tid, char *trace_id, char *span_id, size_t 
     if (connect(sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) { close(sock); return -1; }
 
     char req[64];
-    snprintf(req, sizeof(req), "%d\n", tid);
+    snprintf(req, sizeof(req), "QUERY %d\n", tid);
     send(sock, req, strlen(req), 0);
 
     char resp[256];
@@ -114,13 +117,16 @@ static int export_to_otel(const char *json_payload) {
 }
 
 int main(int argc, char *argv[]) {
+    if (argc < 2) { fprintf(stderr, "Usage: %s <cgroup.procs path>\n", argv[0]); return 1; }
     signal(SIGINT, handle_sigint);
     signal(SIGTERM, handle_sigint);
 
     curl_global_init(CURL_GLOBAL_ALL);
 
+    g_cgroup_path = argv[1];
+
     /* Initialize perf & mmap */
-    perf_fd = open_perf_event("/sys/fs/cgroup/app-service/cgroup.procs", BASELINE_FREQ);
+    perf_fd = open_perf_event(g_cgroup_path, BASELINE_FREQ);
     if (perf_fd < 0) return 1;
     int page_size = sysconf(_SC_PAGESIZE);
     mmap_buf = mmap(NULL, (MMAP_PAGES + 1) * page_size, PROT_READ | PROT_WRITE, MAP_SHARED, perf_fd, 0);
@@ -160,9 +166,10 @@ int main(int argc, char *argv[]) {
         while (tail < head) {
             struct perf_event_header *hdr = (void*)(data + (tail % (MMAP_PAGES * page_size)));
             if (hdr->type == PERF_RECORD_SAMPLE) {
-                struct perf_sample_id *sid = (void*)(hdr + 1);
-                /* Simplified: extract TID, TIME, IP. In prod, parse using sample_type mask */
-                pid_t tid = sid->tid;
+                /* Layout matches sample_type: IP | TID | TIME */
+                struct { uint64_t ip; uint32_t pid; uint32_t tid; uint64_t time; } *s =
+                    (void*)(hdr + 1);
+                pid_t tid = (pid_t)s->tid;
                 char trace_id[64] = "unknown", span_id[64] = "unknown";
                 fetch_trace_context(tid, trace_id, span_id, sizeof(trace_id));
 
