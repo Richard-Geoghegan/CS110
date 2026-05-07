@@ -37,8 +37,14 @@ static void handle_sigint(int sig) { running = 0; }
 
 /* Open perf event scoped to a cgroup v2 container */
 static int open_perf_event(const char *cgroup_path, int freq) {
-    int cg_fd = open(cgroup_path, O_RDONLY);
-    if (cg_fd < 0) { perror("cgroup open"); return -1; }
+    /* kernel needs the cgroup directory fd, not the cgroup.procs file */
+    char cg_dir[512];
+    strncpy(cg_dir, cgroup_path, sizeof(cg_dir) - 1);
+    char *slash = strrchr(cg_dir, '/');
+    if (slash) *slash = '\0';   /* strip /cgroup.procs → get directory */
+
+    int cg_fd = open(cg_dir, O_RDONLY);
+    if (cg_fd < 0) { perror("cgroup dir open"); return -1; }
 
     struct perf_event_attr pe = {0};
     pe.type = PERF_TYPE_HARDWARE;
