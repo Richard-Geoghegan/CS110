@@ -173,8 +173,13 @@ int main(int argc, char *argv[]) {
         uint64_t tail = header->data_tail;
         char *data = mmap_buf + page_size;
 
+        if (head != tail)
+            printf("[DAEMON] Ring buffer: head=%lu tail=%lu diff=%lu\n",
+                   head, tail, head - tail);
+
         while (tail < head) {
             struct perf_event_header *hdr = (void*)(data + (tail % (MMAP_PAGES * page_size)));
+            printf("[DAEMON] Record type=%u size=%u\n", hdr->type, hdr->size);
             if (hdr->type == PERF_RECORD_SAMPLE) {
                 /* Layout matches sample_type: IP | TID | TIME */
                 struct { uint64_t ip; uint32_t pid; uint32_t tid; uint64_t time; } *s =
