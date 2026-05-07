@@ -17,7 +17,6 @@ apt-get install -y --no-install-recommends \
     linux-tools-generic \
     linux-tools-"$(uname -r)" \
     cpufrequtils \
-    linux-cpupower \
     python3-pip \
     python3-venv \
     ca-certificates \
