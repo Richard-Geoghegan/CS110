@@ -46,11 +46,10 @@ static int open_perf_pid(pid_t pid, int freq) {
     pe.freq        = 1;
     pe.sample_freq = freq;
     pe.sample_type = PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_TIME;
-    pe.disabled    = 0;
+    pe.disabled    = 1;          /* start disabled; enable after mmap */
     pe.exclude_kernel = 1;
     pe.exclude_hv     = 1;
-    pe.use_clockid = 1;
-    pe.clockid     = CLOCK_MONOTONIC;
+    /* do NOT set use_clockid — breaks sampling silently on some kernels */
 
     int fd = syscall(SYS_perf_event_open, &pe, pid, -1, -1, PERF_FLAG_FD_CLOEXEC);
     if (fd < 0) {
@@ -80,6 +79,10 @@ static int open_perf_for_cgroup(const char *cgroup_procs_path, int freq) {
             close(fd);
             continue;
         }
+
+        /* Enable counter NOW — after mmap is ready to receive records */
+        ioctl(fd, PERF_EVENT_IOC_RESET,  0);
+        ioctl(fd, PERF_EVENT_IOC_ENABLE, 0);
 
         tracked[n_tracked].pid = pid;
         tracked[n_tracked].fd  = fd;
@@ -154,6 +157,10 @@ static void drain(tracked_t *t) {
     __sync_synchronize();
     uint64_t head = hdr->data_head;
     uint64_t tail = hdr->data_tail;
+
+    if (head != tail)
+        printf("[DEBUG] pid=%d head=%lu tail=%lu delta=%lu\n",
+               t->pid, head, tail, head - tail);
 
     while (tail < head) {
         struct perf_event_header *rec =
