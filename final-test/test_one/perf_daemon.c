@@ -40,11 +40,8 @@ static int n_tracked = 0;
 /* Open perf event for a single PID */
 static int open_perf_pid(pid_t pid, int freq) {
     struct perf_event_attr pe = {0};
-    /* Use SW CPU_CLOCK to validate ring-buffer path — works on every kernel.
-       Switch back to PERF_TYPE_HARDWARE / PERF_COUNT_HW_CACHE_MISSES once
-       we confirm samples flow. */
-    pe.type        = PERF_TYPE_SOFTWARE;
-    pe.config      = PERF_COUNT_SW_CPU_CLOCK;
+    pe.type        = PERF_TYPE_HARDWARE;
+    pe.config      = PERF_COUNT_HW_CACHE_MISSES;
     pe.size        = sizeof(pe);
     pe.freq        = 1;
     pe.sample_freq = freq;
@@ -150,8 +147,6 @@ static int export_to_otel(const char *json) {
     return (res == CURLE_OK) ? 0 : -1;
 }
 
-static int drain_calls = 0;
-
 /* Drain ring buffer for one tracked entry */
 static void drain(tracked_t *t) {
     int page_size = sysconf(_SC_PAGESIZE);
@@ -162,9 +157,6 @@ static void drain(tracked_t *t) {
     uint64_t head = hdr->data_head;
     uint64_t tail = hdr->data_tail;
 
-    /* Print every ~2 seconds (200 × 10ms polls) to show if head advances */
-    if (++drain_calls % 200 == 0)
-        printf("[DEBUG] pid=%d head=%lu tail=%lu\n", t->pid, head, tail);
 
     while (tail < head) {
         struct perf_event_header *rec =
