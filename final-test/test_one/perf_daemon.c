@@ -56,6 +56,7 @@ static int open_perf_event(const char *cgroup_path, int freq) {
     /* cgroup-scoped sampling: pass cgroup fd as pid with PERF_FLAG_PID_CGROUP */
     int fd = syscall(SYS_perf_event_open, &pe, cg_fd, 0, -1,
                      PERF_FLAG_FD_CLOEXEC | PERF_FLAG_PID_CGROUP);
+    if (fd < 0) perror("perf_event_open");
     close(cg_fd);
     return fd;
 }
