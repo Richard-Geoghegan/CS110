@@ -1,4 +1,4 @@
-/* perf_daemon.c - Container-scoped PMU sampler with OTLP export & SLO-triggered frequency toggle */
+/* perf_daemon.c - PID-list PMU sampler with OTLP export */
 #define _GNU_SOURCE
 #include <linux/perf_event.h>
 #include <sys/syscall.h>
@@ -17,197 +17,212 @@
 #include <time.h>
 #include <stdatomic.h>
 #include <stdint.h>
+#include <dirent.h>
 
-#define MMAP_PAGES        8
-#define BASELINE_FREQ     100
-#define TRIGGERED_FREQ    4000
+#define MMAP_PAGES        16
+#define MAX_PIDS          256
 #define OTLP_ENDPOINT     "http://localhost:4318/v1/traces"
-#define BATCH_SIZE        64
 #define TIMEOUT_MS        500
-#define CTL_SOCKET_PATH   "/tmp/perf_daemon_ctl"
 
 static volatile sig_atomic_t running = 1;
-static int perf_fd = -1;
-static void *mmap_buf = NULL;
-static int ctl_fd = -1;
-static atomic_int current_freq = BASELINE_FREQ;
-static const char *g_cgroup_path = NULL;
+static void handle_sigint(int sig) { (void)sig; running = 0; }
 
-static void handle_sigint(int sig) { running = 0; }
+/* One perf fd + mmap per tracked PID */
+typedef struct {
+    pid_t  pid;
+    int    fd;
+    void  *buf;
+} tracked_t;
 
-/* Open perf event scoped to a cgroup v2 container */
-static int open_perf_event(const char *cgroup_path, int freq) {
-    /* kernel needs the cgroup directory fd, not the cgroup.procs file */
-    char cg_dir[512];
-    strncpy(cg_dir, cgroup_path, sizeof(cg_dir) - 1);
-    char *slash = strrchr(cg_dir, '/');
-    if (slash) *slash = '\0';   /* strip /cgroup.procs → get directory */
+static tracked_t tracked[MAX_PIDS];
+static int n_tracked = 0;
 
-    int cg_fd = open(cg_dir, O_RDONLY);
-    if (cg_fd < 0) { perror("cgroup dir open"); return -1; }
-
+/* Open perf event for a single PID */
+static int open_perf_pid(pid_t pid, int freq) {
     struct perf_event_attr pe = {0};
-    pe.type = PERF_TYPE_HARDWARE;
-    pe.config = PERF_COUNT_HW_CACHE_MISSES;
-    pe.size = sizeof(pe);
-    pe.freq = 1;           /* required: treat sample_period as a frequency */
+    pe.type        = PERF_TYPE_HARDWARE;
+    pe.config      = PERF_COUNT_HW_CACHE_MISSES;
+    pe.size        = sizeof(pe);
+    pe.freq        = 1;
     pe.sample_freq = freq;
     pe.sample_type = PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_TIME;
-    pe.disabled = 0;
+    pe.disabled    = 0;
     pe.exclude_kernel = 1;
-    pe.exclude_hv = 1;
+    pe.exclude_hv     = 1;
     pe.use_clockid = 1;
-    pe.clockid = CLOCK_MONOTONIC;
+    pe.clockid     = CLOCK_MONOTONIC;
 
-    /* cgroup-scoped sampling: pass cgroup fd as pid with PERF_FLAG_PID_CGROUP */
-    int fd = syscall(SYS_perf_event_open, &pe, cg_fd, 0, -1,
-                     PERF_FLAG_FD_CLOEXEC | PERF_FLAG_PID_CGROUP);
-    if (fd < 0) perror("perf_event_open");
-    close(cg_fd);
+    int fd = syscall(SYS_perf_event_open, &pe, pid, -1, -1, PERF_FLAG_FD_CLOEXEC);
+    if (fd < 0) {
+        fprintf(stderr, "[DAEMON] perf_event_open pid=%d: %s\n", pid, strerror(errno));
+        return -1;
+    }
     return fd;
 }
 
-/* SLO-triggered frequency toggle */
-static int toggle_sampling_freq(int new_freq) {
-    if (new_freq == atomic_load(&current_freq)) return 0;
-    printf("[DAEMON] Toggling sampling: %d Hz -> %d Hz\n", atomic_load(&current_freq), new_freq);
-    
-    /* Recreate fd with new frequency (safest for live tuning) */
-    if (perf_fd >= 0) close(perf_fd);
-    perf_fd = open_perf_event(g_cgroup_path, new_freq);
-    if (perf_fd < 0) return -1;
+/* Read PIDs from cgroup.procs and open a perf fd for each */
+static int open_perf_for_cgroup(const char *cgroup_procs_path, int freq) {
+    FILE *f = fopen(cgroup_procs_path, "r");
+    if (!f) { perror("fopen cgroup.procs"); return -1; }
 
-    /* Re-map ring buffer */
-    if (mmap_buf) munmap(mmap_buf, (MMAP_PAGES + 1) * sysconf(_SC_PAGESIZE));
     int page_size = sysconf(_SC_PAGESIZE);
-    mmap_buf = mmap(NULL, (MMAP_PAGES + 1) * page_size, PROT_READ | PROT_WRITE, MAP_SHARED, perf_fd, 0);
-    if (mmap_buf == MAP_FAILED) { perror("mmap"); return -1; }
+    n_tracked = 0;
+    pid_t pid;
 
-    atomic_store(&current_freq, new_freq);
-    return 0;
+    while (fscanf(f, "%d", &pid) == 1 && n_tracked < MAX_PIDS) {
+        int fd = open_perf_pid(pid, freq);
+        if (fd < 0) continue;
+
+        void *buf = mmap(NULL, (MMAP_PAGES + 1) * page_size,
+                         PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        if (buf == MAP_FAILED) {
+            fprintf(stderr, "[DAEMON] mmap pid=%d: %s\n", pid, strerror(errno));
+            close(fd);
+            continue;
+        }
+
+        tracked[n_tracked].pid = pid;
+        tracked[n_tracked].fd  = fd;
+        tracked[n_tracked].buf = buf;
+        n_tracked++;
+        printf("[DAEMON] Tracking pid=%d\n", pid);
+    }
+
+    fclose(f);
+    printf("[DAEMON] Tracking %d PIDs total\n", n_tracked);
+    return n_tracked > 0 ? 0 : -1;
+}
+
+static void close_all() {
+    int page_size = sysconf(_SC_PAGESIZE);
+    for (int i = 0; i < n_tracked; i++) {
+        if (tracked[i].buf) munmap(tracked[i].buf, (MMAP_PAGES + 1) * page_size);
+        if (tracked[i].fd >= 0) close(tracked[i].fd);
+    }
+    n_tracked = 0;
 }
 
 /* Fetch trace context from app-side Unix socket */
-static int fetch_trace_context(pid_t tid, char *trace_id, char *span_id, size_t buf_size) {
+static int fetch_trace_context(pid_t tid, char *trace_id, char *span_id) {
     int sock = socket(AF_UNIX, SOCK_STREAM, 0);
     if (sock < 0) return -1;
+
     struct sockaddr_un addr = {.sun_family = AF_UNIX};
     snprintf(addr.sun_path, sizeof(addr.sun_path), "/tmp/trace_bridge.sock");
-    if (connect(sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) { close(sock); return -1; }
+
+    struct timeval tv = {0, 100000};
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    if (connect(sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        close(sock); return -1;
+    }
 
     char req[64];
     snprintf(req, sizeof(req), "QUERY %d\n", tid);
     send(sock, req, strlen(req), 0);
 
-    char resp[256];
+    char resp[256] = {0};
     ssize_t n = recv(sock, resp, sizeof(resp)-1, 0);
-    resp[n] = '\0';
     close(sock);
 
-    if (sscanf(resp, "%s %s", trace_id, span_id) == 2) return 0;
+    if (n > 0 && sscanf(resp, "%63s %63s", trace_id, span_id) == 2) return 0;
     return -1;
 }
 
-/* Batch OTLP JSON export */
-static int export_to_otel(const char *json_payload) {
+/* OTLP export */
+static int export_to_otel(const char *json) {
     CURL *curl = curl_easy_init();
     if (!curl) return -1;
     curl_easy_setopt(curl, CURLOPT_URL, OTLP_ENDPOINT);
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json_payload);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, TIMEOUT_MS);
-    struct curl_slist *headers = curl_slist_append(NULL, "Content-Type: application/json");
-    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_VERBOSE, 0L);
+    struct curl_slist *hdrs = curl_slist_append(NULL, "Content-Type: application/json");
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
     CURLcode res = curl_easy_perform(curl);
-    curl_slist_free_all(headers);
+    curl_slist_free_all(hdrs);
     curl_easy_cleanup(curl);
     return (res == CURLE_OK) ? 0 : -1;
 }
 
-int main(int argc, char *argv[]) {
-    if (argc < 2) { fprintf(stderr, "Usage: %s <cgroup.procs path> [freq_hz]\n", argv[0]); return 1; }
-    signal(SIGINT, handle_sigint);
-    signal(SIGTERM, handle_sigint);
-
-    curl_global_init(CURL_GLOBAL_ALL);
-
-    g_cgroup_path = argv[1];
-    int start_freq = (argc >= 3) ? atoi(argv[2]) : BASELINE_FREQ;
-    atomic_store(&current_freq, start_freq);
-    printf("[DAEMON] Starting at %d Hz\n", start_freq);
-
-    /* Initialize perf & mmap */
-    perf_fd = open_perf_event(g_cgroup_path, start_freq);
-    if (perf_fd < 0) return 1;
+/* Drain ring buffer for one tracked entry */
+static void drain(tracked_t *t) {
     int page_size = sysconf(_SC_PAGESIZE);
-    mmap_buf = mmap(NULL, (MMAP_PAGES + 1) * page_size, PROT_READ | PROT_WRITE, MAP_SHARED, perf_fd, 0);
-    if (mmap_buf == MAP_FAILED) { perror("mmap"); return 1; }
-    struct perf_event_mmap_page *header = mmap_buf;
+    struct perf_event_mmap_page *hdr = t->buf;
+    char *data = (char*)t->buf + page_size;
 
-    /* Control socket for SLO trigger */
-    ctl_fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    struct sockaddr_un ctl_addr = {.sun_family = AF_UNIX, .sun_path = CTL_SOCKET_PATH};
-    unlink(CTL_SOCKET_PATH);
-    bind(ctl_fd, (struct sockaddr*)&ctl_addr, sizeof(ctl_addr));
-    listen(ctl_fd, 5);
+    __sync_synchronize();
+    uint64_t head = hdr->data_head;
+    uint64_t tail = hdr->data_tail;
 
-    printf("[DAEMON] Running baseline sampling @ %d Hz\n", BASELINE_FREQ);
+    while (tail < head) {
+        struct perf_event_header *rec =
+            (void*)(data + (tail % (MMAP_PAGES * page_size)));
 
-    while (running) {
-        /* Check control socket for SLO trigger */
-        fd_set rfds;
-        FD_ZERO(&rfds); FD_SET(ctl_fd, &rfds);
-        struct timeval tv = {0, 50000}; // 50ms timeout
-        if (select(ctl_fd + 1, &rfds, NULL, NULL, &tv) > 0) {
-            int conn = accept(ctl_fd, NULL, NULL);
-            if (conn >= 0) {
-                char cmd[16]; read(conn, cmd, sizeof(cmd));
-                if (strncmp(cmd, "TRIGGER_HIGH", 12) == 0) toggle_sampling_freq(TRIGGERED_FREQ);
-                else if (strncmp(cmd, "REVERT_BASE", 11) == 0) toggle_sampling_freq(BASELINE_FREQ);
-                close(conn);
-            }
+        if (rec->type == PERF_RECORD_SAMPLE) {
+            struct { uint64_t ip; uint32_t pid; uint32_t tid; uint64_t time; } *s =
+                (void*)(rec + 1);
+
+            char trace_id[64] = "0000000000000000000000000000000000000000000000000000000000000000";
+            char span_id[64]  = "0000000000000000";
+            fetch_trace_context((pid_t)s->tid, trace_id, span_id);
+
+            printf("[DAEMON] sample pid=%u tid=%u trace=%s\n",
+                   s->pid, s->tid, trace_id);
+
+            char json[2048];
+            snprintf(json, sizeof(json),
+                "{\"resourceSpans\":[{\"resource\":{\"attributes\":[{\"key\":\"service.name\","
+                "\"value\":{\"stringValue\":\"perf-daemon\"}}]},\"scopeSpans\":[{\"spans\":["
+                "{\"traceId\":\"%s\",\"spanId\":\"%s\",\"name\":\"pmu_sample\","
+                "\"startTimeUnixNano\":%lu,\"endTimeUnixNano\":%lu,"
+                "\"attributes\":[{\"key\":\"pmu.event\",\"value\":{\"stringValue\":\"cache-misses\"}},"
+                "{\"key\":\"tid\",\"value\":{\"intValue\":%u}}]}]}]}]}",
+                trace_id, span_id, s->time, s->time + 1000, s->tid);
+
+            export_to_otel(json);
+        } else if (rec->type == PERF_RECORD_LOST) {
+            printf("[DAEMON] lost samples\n");
         }
 
-        /* Read ring buffer */
-        __sync_synchronize();
-        uint64_t head = header->data_head;
-        uint64_t tail = header->data_tail;
-        char *data = mmap_buf + page_size;
-
-        if (head != tail)
-            printf("[DAEMON] Ring buffer: head=%lu tail=%lu diff=%lu\n",
-                   head, tail, head - tail);
-
-        while (tail < head) {
-            struct perf_event_header *hdr = (void*)(data + (tail % (MMAP_PAGES * page_size)));
-            printf("[DAEMON] Record type=%u size=%u\n", hdr->type, hdr->size);
-            if (hdr->type == PERF_RECORD_SAMPLE) {
-                /* Layout matches sample_type: IP | TID | TIME */
-                struct { uint64_t ip; uint32_t pid; uint32_t tid; uint64_t time; } *s =
-                    (void*)(hdr + 1);
-                pid_t tid = (pid_t)s->tid;
-                char trace_id[64] = "unknown", span_id[64] = "unknown";
-                fetch_trace_context(tid, trace_id, span_id, sizeof(trace_id));
-
-                /* Build OTLP span attribute payload */
-                char batch_json[2048];
-                snprintf(batch_json, sizeof(batch_json),
-                    "{\"resourceSpans\":[{\"resource\":{},\"scopeSpans\":[{\"spans\":[{\"traceId\":\"%s\",\"spanId\":\"%s\",\"name\":\"pmu_sample\",\"attributes\":[{\"key\":\"pmu.event\",\"value\":{\"stringValue\":\"cache-misses\"}},{\"key\":\"tid\",\"value\":{\"intValue\":%d}}]}]}]}]}",
-                    trace_id, span_id, tid);
-                
-                export_to_otel(batch_json);
-            }
-            tail += hdr->size;
-        }
-        __sync_synchronize();
-        header->data_tail = head;
-        usleep(10000); // 10ms poll
+        if (rec->size == 0) break;
+        tail += rec->size;
     }
 
-    /* Cleanup */
-    if (mmap_buf) munmap(mmap_buf, (MMAP_PAGES + 1) * page_size);
-    if (perf_fd >= 0) close(perf_fd);
-    close(ctl_fd);
+    __sync_synchronize();
+    hdr->data_tail = head;
+}
+
+int main(int argc, char *argv[]) {
+    if (argc < 2) {
+        fprintf(stderr, "Usage: %s <cgroup.procs path> [freq_hz]\n", argv[0]);
+        return 1;
+    }
+
+    signal(SIGINT,  handle_sigint);
+    signal(SIGTERM, handle_sigint);
+    curl_global_init(CURL_GLOBAL_ALL);
+
+    const char *cgroup_procs = argv[1];
+    int freq = (argc >= 3) ? atoi(argv[2]) : 100;
+
+    printf("[DAEMON] Starting at %d Hz\n", freq);
+
+    if (open_perf_for_cgroup(cgroup_procs, freq) < 0) {
+        fprintf(stderr, "[DAEMON] Failed to open any perf events\n");
+        return 1;
+    }
+
+    printf("[DAEMON] Running — polling ring buffers\n");
+
+    while (running) {
+        for (int i = 0; i < n_tracked; i++)
+            drain(&tracked[i]);
+        usleep(10000); /* 10ms poll */
+    }
+
+    close_all();
     curl_global_cleanup();
-    printf("[DAEMON] Shutdown complete.\n");
+    printf("[DAEMON] Shutdown complete\n");
     return 0;
 }
