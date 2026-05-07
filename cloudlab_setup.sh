@@ -112,8 +112,9 @@ echo "CPU info:"
 grep "model name" /proc/cpuinfo | head -1
 echo ""
 echo "Governor (first 4 cores):"
-for g in /sys/devices/system/cpu/cpu{0..3}/cpufreq/scaling_governor 2>/dev/null; do
-    [ -f "$g" ] && echo "  $g: $(cat $g)"
+for i in 0 1 2 3; do
+    g="/sys/devices/system/cpu/cpu${i}/cpufreq/scaling_governor"
+    [ -f "$g" ] && echo "  cpu${i}: $(cat $g)"
 done
 echo ""
 echo "Current MHz (first 4 cores):"
