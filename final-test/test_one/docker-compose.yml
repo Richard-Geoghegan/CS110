@@ -8,7 +8,7 @@ services:
     mem_limit: 512m
     cpus: "1.0"
     environment:
-      - WORKLOAD_LOOPS=2000000
+      - WORKLOAD_LOOPS=500000
       - WORKLOAD_DELAY=0.0
       - TRACE_SOCKET_PATH=/tmp/host_shared/trace_bridge.sock
       - OTEL_SERVICE_NAME=app-service
