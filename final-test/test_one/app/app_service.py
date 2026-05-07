@@ -61,11 +61,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             span.set_attribute("trace_id", trace_id)
             
             start = time.monotonic()
-            # CPU Bound
-            x = 0
-            for _ in range(LOOPS): x += 1
-            # I/O Bound
-            time.sleep(DELAY)
+            # Memory-intensive CPU work — repeatedly read a large array
+            # to generate cache misses that the PMU can observe
+            arr = list(range(LOOPS))
+            total = 0
+            for i in range(0, len(arr), 8):   # stride-8 access pattern
+                total += arr[i]
             latency = (time.monotonic() - start) * 1000
             
             span.set_attribute("latency_ms", latency)

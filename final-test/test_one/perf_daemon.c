@@ -42,7 +42,7 @@ static int open_perf_event(const char *cgroup_path, int freq) {
 
     struct perf_event_attr pe = {0};
     pe.type = PERF_TYPE_HARDWARE;
-    pe.config = PERF_COUNT_HW_CACHE_MISSES;
+    pe.config = PERF_COUNT_HW_CPU_CYCLES;
     pe.size = sizeof(pe);
     pe.freq = 1;           /* required: treat sample_period as a frequency */
     pe.sample_freq = freq;
@@ -179,7 +179,7 @@ int main(int argc, char *argv[]) {
                 /* Build OTLP span attribute payload */
                 char batch_json[2048];
                 snprintf(batch_json, sizeof(batch_json),
-                    "{\"resourceSpans\":[{\"resource\":{},\"scopeSpans\":[{\"spans\":[{\"traceId\":\"%s\",\"spanId\":\"%s\",\"name\":\"pmu_sample\",\"attributes\":[{\"key\":\"pmu.event\",\"value\":{\"stringValue\":\"cache-misses\"}},{\"key\":\"tid\",\"value\":{\"intValue\":%d}}]}]}]}]}",
+                    "{\"resourceSpans\":[{\"resource\":{},\"scopeSpans\":[{\"spans\":[{\"traceId\":\"%s\",\"spanId\":\"%s\",\"name\":\"pmu_sample\",\"attributes\":[{\"key\":\"pmu.event\",\"value\":{\"stringValue\":\"cpu-cycles\"}},{\"key\":\"tid\",\"value\":{\"intValue\":%d}}]}]}]}]}",
                     trace_id, span_id, tid);
                 
                 export_to_otel(batch_json);
