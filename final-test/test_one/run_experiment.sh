@@ -100,17 +100,10 @@ for FREQ in "${FREQUENCIES[@]}"; do
     echo "=== Phase: $PHASE_LABEL ==="
 
     if [[ "$FREQ" -gt 0 ]]; then
-        # For 4000Hz, trigger the high-frequency mode via control socket after start
-        # perf_daemon always starts at BASELINE_FREQ (100Hz); toggle up if needed
-        sudo "$DAEMON_BIN" "$CG_PATH" &
+        sudo "$DAEMON_BIN" "$CG_PATH" "$FREQ" &
         DAEMON_PID=$!
-        sleep 1
-        if [[ "$FREQ" -gt 100 ]]; then
-            printf "TRIGGER_HIGH" | nc -U /tmp/perf_daemon_ctl 2>/dev/null \
-                && echo "[EXP] Triggered high-frequency mode (${FREQ} Hz)" \
-                || echo "[EXP] Control socket unavailable; daemon running at baseline."
-        fi
-        sleep 1   # settle
+        sleep 2   # let daemon initialize and start sampling
+        echo "[EXP] Daemon running @ ${FREQ} Hz (PID $DAEMON_PID)"
     else
         echo "[EXP] Baseline: no perf daemon."
     fi

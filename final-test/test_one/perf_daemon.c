@@ -117,16 +117,19 @@ static int export_to_otel(const char *json_payload) {
 }
 
 int main(int argc, char *argv[]) {
-    if (argc < 2) { fprintf(stderr, "Usage: %s <cgroup.procs path>\n", argv[0]); return 1; }
+    if (argc < 2) { fprintf(stderr, "Usage: %s <cgroup.procs path> [freq_hz]\n", argv[0]); return 1; }
     signal(SIGINT, handle_sigint);
     signal(SIGTERM, handle_sigint);
 
     curl_global_init(CURL_GLOBAL_ALL);
 
     g_cgroup_path = argv[1];
+    int start_freq = (argc >= 3) ? atoi(argv[2]) : BASELINE_FREQ;
+    atomic_store(&current_freq, start_freq);
+    printf("[DAEMON] Starting at %d Hz\n", start_freq);
 
     /* Initialize perf & mmap */
-    perf_fd = open_perf_event(g_cgroup_path, BASELINE_FREQ);
+    perf_fd = open_perf_event(g_cgroup_path, start_freq);
     if (perf_fd < 0) return 1;
     int page_size = sysconf(_SC_PAGESIZE);
     mmap_buf = mmap(NULL, (MMAP_PAGES + 1) * page_size, PROT_READ | PROT_WRITE, MAP_SHARED, perf_fd, 0);
