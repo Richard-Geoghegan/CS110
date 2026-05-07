@@ -25,8 +25,8 @@ apt-get install -y --no-install-recommends \
     lsb-release \
     jq
 
-# pip packages for plotting
-pip3 install --quiet matplotlib requests pandas
+# pip packages for plotting (Ubuntu 24 requires --break-system-packages or venv)
+pip3 install --quiet --break-system-packages matplotlib requests pandas
 
 echo "=== [2/7] Docker ==="
 if ! command -v docker &>/dev/null; then
