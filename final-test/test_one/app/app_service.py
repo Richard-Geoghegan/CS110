@@ -43,7 +43,7 @@ def get_host_tid():
         with open('/proc/thread-self/status') as f:
             for line in f:
                 if line.startswith('NSpid:'):
-                    return int(line.split()[1])  # outermost = host namespace
+                    return int(line.split()[-1])  # last = outermost (host) namespace
     except Exception:
         pass
     return threading.get_native_id()  # fallback
