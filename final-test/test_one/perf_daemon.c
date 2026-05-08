@@ -1,4 +1,10 @@
-/* perf_daemon.c - PID-list PMU sampler with OTLP export */
+/* perf_daemon.c - PID-list PMU sampler with OTLP export
+ *
+ * Key design: perf_event_open(pid=TID) monitors only that exact thread.
+ * To capture handler threads spawned by ThreadingHTTPServer we must
+ * enumerate /proc/<TGID>/task/ and open a separate fd per TID, refreshing
+ * every second to pick up newly created threads.
+ */
 #define _GNU_SOURCE
 #include <linux/perf_event.h>
 #include <sys/syscall.h>
@@ -15,87 +21,113 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <time.h>
-#include <stdatomic.h>
 #include <stdint.h>
 #include <dirent.h>
 
 #define MMAP_PAGES        16
-#define MAX_PIDS          256
+#define MAX_TGIDS         32
+#define MAX_TRACKED       2048   /* room for many short-lived handler threads */
 #define OTLP_ENDPOINT     "http://localhost:4318/v1/traces"
 #define TIMEOUT_MS        500
 
 static volatile sig_atomic_t running = 1;
 static void handle_sigint(int sig) { (void)sig; running = 0; }
 
-/* One perf fd + mmap per tracked PID */
+/* One perf fd + mmap per tracked TID */
 typedef struct {
-    pid_t  pid;
+    pid_t  tid;
     int    fd;
     void  *buf;
 } tracked_t;
 
-static tracked_t tracked[MAX_PIDS];
-static int n_tracked = 0;
+static pid_t     tgids[MAX_TGIDS];
+static int       n_tgids   = 0;
+static tracked_t tracked[MAX_TRACKED];
+static int       n_tracked = 0;
+static int       g_freq    = 100;
 
-/* Open perf event for a single PID */
-static int open_perf_pid(pid_t pid, int freq) {
+/* Open a frequency-based perf event for a single TID */
+static int open_perf_tid(pid_t tid) {
     struct perf_event_attr pe = {0};
-    pe.type        = PERF_TYPE_HARDWARE;
-    pe.config      = PERF_COUNT_HW_CACHE_MISSES;
-    pe.size        = sizeof(pe);
-    pe.freq        = 1;
-    pe.sample_freq = freq;
-    pe.sample_type = PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_TIME;
-    pe.disabled    = 1;          /* start disabled; enable after mmap */
+    pe.type           = PERF_TYPE_HARDWARE;
+    pe.config         = PERF_COUNT_HW_CACHE_MISSES;
+    pe.size           = sizeof(pe);
+    pe.freq           = 1;
+    pe.sample_freq    = (uint64_t)g_freq;
+    pe.sample_type    = PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_TIME;
+    pe.disabled       = 1;
     pe.exclude_kernel = 1;
     pe.exclude_hv     = 1;
 
-    int fd = syscall(SYS_perf_event_open, &pe, pid, -1, -1, PERF_FLAG_FD_CLOEXEC);
-    if (fd < 0) {
-        fprintf(stderr, "[DAEMON] perf_event_open pid=%d: %s\n", pid, strerror(errno));
-        return -1;
-    }
+    int fd = syscall(SYS_perf_event_open, &pe, tid, -1, -1, PERF_FLAG_FD_CLOEXEC);
+    if (fd < 0) return -1;
     return fd;
 }
 
-/* Read PIDs from cgroup.procs and open a perf fd for each */
-static int open_perf_for_cgroup(const char *cgroup_procs_path, int freq) {
-    FILE *f = fopen(cgroup_procs_path, "r");
-    if (!f) { perror("fopen cgroup.procs"); return -1; }
+/* Scan /proc/<tgid>/task/ and open perf fds for any TID not yet tracked */
+static void scan_tgid_threads(pid_t tgid) {
+    char task_dir[64];
+    snprintf(task_dir, sizeof(task_dir), "/proc/%d/task", tgid);
+
+    DIR *d = opendir(task_dir);
+    if (!d) return;   /* process may have exited */
 
     int page_size = sysconf(_SC_PAGESIZE);
-    n_tracked = 0;
-    pid_t pid;
+    struct dirent *ent;
 
-    while (fscanf(f, "%d", &pid) == 1 && n_tracked < MAX_PIDS) {
-        int fd = open_perf_pid(pid, freq);
+    while ((ent = readdir(d)) != NULL && n_tracked < MAX_TRACKED) {
+        if (ent->d_name[0] == '.') continue;
+        pid_t tid = (pid_t)atoi(ent->d_name);
+        if (tid <= 0) continue;
+
+        /* Skip if already tracked */
+        int found = 0;
+        for (int i = 0; i < n_tracked; i++) {
+            if (tracked[i].tid == tid) { found = 1; break; }
+        }
+        if (found) continue;
+
+        int fd = open_perf_tid(tid);
         if (fd < 0) continue;
 
         void *buf = mmap(NULL, (MMAP_PAGES + 1) * page_size,
                          PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-        if (buf == MAP_FAILED) {
-            fprintf(stderr, "[DAEMON] mmap pid=%d: %s\n", pid, strerror(errno));
-            close(fd);
-            continue;
-        }
+        if (buf == MAP_FAILED) { close(fd); continue; }
 
-        /* Enable counter NOW — after mmap is ready to receive records */
         ioctl(fd, PERF_EVENT_IOC_RESET,  0);
         ioctl(fd, PERF_EVENT_IOC_ENABLE, 0);
 
-        tracked[n_tracked].pid = pid;
+        tracked[n_tracked].tid = tid;
         tracked[n_tracked].fd  = fd;
         tracked[n_tracked].buf = buf;
         n_tracked++;
-        printf("[DAEMON] Tracking pid=%d\n", pid);
+        printf("[DAEMON] Tracking tid=%d (tgid=%d)\n", tid, tgid);
     }
+    closedir(d);
+}
 
+/* Read TGIDs from cgroup.procs and do initial thread scan */
+static int open_perf_for_cgroup(const char *cgroup_procs_path) {
+    FILE *f = fopen(cgroup_procs_path, "r");
+    if (!f) { perror("fopen cgroup.procs"); return -1; }
+
+    pid_t pid;
+    while (fscanf(f, "%d", &pid) == 1 && n_tgids < MAX_TGIDS) {
+        tgids[n_tgids++] = pid;
+        printf("[DAEMON] Found tgid=%d\n", pid);
+    }
     fclose(f);
-    printf("[DAEMON] Tracking %d PIDs total\n", n_tracked);
+
+    /* Initial thread scan for each TGID */
+    for (int i = 0; i < n_tgids; i++)
+        scan_tgid_threads(tgids[i]);
+
+    printf("[DAEMON] Tracking %d threads across %d processes\n",
+           n_tracked, n_tgids);
     return n_tracked > 0 ? 0 : -1;
 }
 
-static void close_all() {
+static void close_all(void) {
     int page_size = sysconf(_SC_PAGESIZE);
     for (int i = 0; i < n_tracked; i++) {
         if (tracked[i].buf) munmap(tracked[i].buf, (MMAP_PAGES + 1) * page_size);
@@ -157,20 +189,19 @@ static void drain(tracked_t *t) {
     uint64_t head = hdr->data_head;
     uint64_t tail = hdr->data_tail;
 
-
     while (tail < head) {
         struct perf_event_header *rec =
             (void*)(data + (tail % (MMAP_PAGES * page_size)));
 
         if (rec->type == PERF_RECORD_SAMPLE) {
-            struct { uint64_t ip; uint32_t pid; uint32_t tid; uint64_t time; } *s =
-                (void*)(rec + 1);
+            struct { uint64_t ip; uint32_t pid; uint32_t tid;
+                     uint64_t time; } *s = (void*)(rec + 1);
 
             char trace_id[64] = "0000000000000000000000000000000000000000000000000000000000000000";
             char span_id[64]  = "0000000000000000";
             fetch_trace_context((pid_t)s->tid, trace_id, span_id);
 
-            printf("[DAEMON] sample pid=%u tid=%u trace=%s\n",
+            printf("[DAEMON] sample pid=%u tid=%u trace=%.16s\n",
                    s->pid, s->tid, trace_id);
 
             char json[2048];
@@ -184,6 +215,7 @@ static void drain(tracked_t *t) {
                 trace_id, span_id, s->time, s->time + 1000, s->tid);
 
             export_to_otel(json);
+
         } else if (rec->type == PERF_RECORD_LOST) {
             printf("[DAEMON] lost samples\n");
         }
@@ -206,21 +238,27 @@ int main(int argc, char *argv[]) {
     signal(SIGTERM, handle_sigint);
     curl_global_init(CURL_GLOBAL_ALL);
 
-    const char *cgroup_procs = argv[1];
-    int freq = (argc >= 3) ? atoi(argv[2]) : 100;
+    g_freq = (argc >= 3) ? atoi(argv[2]) : 100;
+    printf("[DAEMON] Starting at %d Hz\n", g_freq);
 
-    printf("[DAEMON] Starting at %d Hz\n", freq);
-
-    if (open_perf_for_cgroup(cgroup_procs, freq) < 0) {
+    if (open_perf_for_cgroup(argv[1]) < 0) {
         fprintf(stderr, "[DAEMON] Failed to open any perf events\n");
         return 1;
     }
 
     printf("[DAEMON] Running — polling ring buffers\n");
 
+    int poll_count = 0;
     while (running) {
+        /* Re-scan for new handler threads every ~1 second (100 × 10ms) */
+        if (++poll_count % 100 == 0) {
+            for (int i = 0; i < n_tgids; i++)
+                scan_tgid_threads(tgids[i]);
+        }
+
         for (int i = 0; i < n_tracked; i++)
             drain(&tracked[i]);
+
         usleep(10000); /* 10ms poll */
     }
 

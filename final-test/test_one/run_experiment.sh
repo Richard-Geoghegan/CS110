@@ -94,6 +94,13 @@ trap 'stop_daemon; docker compose down -q 2>/dev/null' EXIT
 CG_PATH=$(resolve_cgroup_path)
 echo "[EXP] cgroup path: $CG_PATH"
 
+# Warmup: one full profiler pass so Python JIT, OS page tables, and
+# container caches are hot before we record any measurements.
+echo "[EXP] Warming up (discarded)..."
+python3 "$SCRIPT_DIR/baseline_profiler.py" > /dev/null 2>&1 || true
+sleep 2
+echo "[EXP] Warmup done."
+
 # Write CSV header
 echo "freq_hz,p50_ms,p99_ms,rps,error_pct" > "$RESULTS"
 
