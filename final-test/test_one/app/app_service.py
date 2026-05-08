@@ -52,7 +52,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             trace_id, span_id = gen_trace_id(), gen_span_id()
         
         # 2. Register with Bridge (Phase 3)
-        current_tid = threading.get_ident()
+        # get_native_id() returns the Linux kernel TID, which matches what
+        # perf's PERF_SAMPLE_TID captures — get_ident() is a Python-internal
+        # opaque value that differs from the kernel TID on handler threads.
+        current_tid = threading.get_native_id()
         register_bridge(current_tid, trace_id, span_id)
         
         # 3. Create OTel Span

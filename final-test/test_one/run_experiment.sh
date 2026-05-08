@@ -6,7 +6,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 TARGET_URL="${TARGET_URL:-http://localhost:8080}"
-VUS="${VUS:-10}"
+VUS="${VUS:-25}"
 DURATION="${DURATION:-30}"
 RESULTS="$SCRIPT_DIR/overhead_results.csv"
 DAEMON_BIN="$SCRIPT_DIR/perf_daemon"
