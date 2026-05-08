@@ -31,6 +31,23 @@ BRIDGE_SOCKET = os.getenv("TRACE_SOCKET_PATH", "/tmp/trace_bridge.sock")
 def gen_trace_id(): return uuid.uuid4().hex + uuid.uuid4().hex
 def gen_span_id(): return uuid.uuid4().hex[:16]
 
+def get_host_tid():
+    """Return the host-namespace TID so it matches PERF_SAMPLE_TID on the host.
+
+    Docker uses a PID namespace: threading.get_native_id() returns the
+    container-local TID (e.g. 7), but perf on the host sees the root-namespace
+    TID (e.g. 56401). /proc/thread-self/status NSpid lists namespaces outermost
+    first, so NSpid[0] == host TID.
+    """
+    try:
+        with open('/proc/thread-self/status') as f:
+            for line in f:
+                if line.startswith('NSpid:'):
+                    return int(line.split()[1])  # outermost = host namespace
+    except Exception:
+        pass
+    return threading.get_native_id()  # fallback
+
 def register_bridge(tid, trace_id, span_id):
     """Send mapping to the bridge socket"""
     try:
@@ -55,7 +72,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # get_native_id() returns the Linux kernel TID, which matches what
         # perf's PERF_SAMPLE_TID captures — get_ident() is a Python-internal
         # opaque value that differs from the kernel TID on handler threads.
-        current_tid = threading.get_native_id()
+        current_tid = get_host_tid()
         register_bridge(current_tid, trace_id, span_id)
         
         # 3. Create OTel Span
