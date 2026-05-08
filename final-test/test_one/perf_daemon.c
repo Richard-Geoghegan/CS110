@@ -248,13 +248,10 @@ int main(int argc, char *argv[]) {
 
     printf("[DAEMON] Running — polling ring buffers\n");
 
-    int poll_count = 0;
     while (running) {
-        /* Re-scan for new handler threads every ~1 second (100 × 10ms) */
-        if (++poll_count % 100 == 0) {
-            for (int i = 0; i < n_tgids; i++)
-                scan_tgid_threads(tgids[i]);
-        }
+        /* Scan every poll (10ms) — handler threads live ~30ms so 1s was too slow */
+        for (int i = 0; i < n_tgids; i++)
+            scan_tgid_threads(tgids[i]);
 
         for (int i = 0; i < n_tracked; i++)
             drain(&tracked[i]);
