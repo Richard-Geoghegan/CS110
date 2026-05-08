@@ -5,9 +5,9 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-TARGET_URL="${TARGET_URL:-http://localhost:8080}"
-VUS="${VUS:-25}"
-DURATION="${DURATION:-30}"
+export TARGET_URL="${TARGET_URL:-http://localhost:8080}"
+export VUS="${VUS:-25}"
+export DURATION="${DURATION:-30}"
 RESULTS="$SCRIPT_DIR/overhead_results.csv"
 DAEMON_BIN="$SCRIPT_DIR/perf_daemon"
 FREQUENCIES=(0 100 1000 4000)   # 0 = baseline (daemon off)
